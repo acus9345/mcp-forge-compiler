@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "mcp-forge-devtools": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-forge-compiler",
+        "serve",
+        "git",
+        "rg",
+        "find",
+        "docker",
+        "kubectl"
+      ]
+    }
+  }
+}

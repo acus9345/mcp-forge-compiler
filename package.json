@@ -1,0 +1,44 @@
+{
+  "name": "mcp-forge-compiler",
+  "version": "1.0.0",
+  "description": "Zero-Config CLI-to-MCP Compiler, Context-Window Guard & Execution Firewall for AI Agents",
+  "type": "module",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "bin": {
+    "mcp-forge": "./dist/src/cli.js"
+  },
+  "files": [
+    "dist/src",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "node --test dist/tests/mcp-forge.test.js",
+    "start": "node dist/src/cli.js",
+    "demo": "node dist/src/cli.js demo"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "ai-agents",
+    "llm-tools",
+    "cli-to-mcp",
+    "agent-firewall",
+    "context-window",
+    "tool-calling",
+    "claude-desktop",
+    "cursor"
+  ],
+  "author": "mcp-forge contributors",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0"
+  }
+}
