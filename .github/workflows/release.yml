@@ -1,0 +1,89 @@
+# ship:creates-github-release
+# On a v* tag: test, publish to npm via trusted publishing (no stored token),
+# then create the GitHub release from CHANGELOG.md.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+      - name: Tag must match package.json
+        shell: bash
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match package.json version $version"
+            exit 1
+          fi
+      - run: npm install --no-audit --no-fund
+      - run: npm run build --if-present
+      - run: npm run test --if-present
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Trusted publishing needs npm 11.5.1 or later
+        run: npm install -g npm@latest
+      - name: Skip if this version is already on npm
+        id: exists
+        shell: bash
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if npm view "mcp-forge-compiler@$version" version > /dev/null 2>&1; then
+            echo "mcp-forge-compiler $version is already on npm; skipping publish."
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+      - run: npm install --no-audit --no-fund
+        if: steps.exists.outputs.published == 'false'
+      - name: Publish (trusted publishing, with provenance; no stored token)
+        if: steps.exists.outputs.published == 'false'
+        run: npm publish --access public
+
+  github-release:
+    needs: [test, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Release notes from CHANGELOG.md
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            /^## \[/ { if (found) exit; if (index($0, "[" v "]")) { found = 1; next } }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "Release $GITHUB_REF_NAME" > notes.md
+      - name: Create the GitHub release (never modifies an existing one)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists."
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes-file notes.md
+          fi

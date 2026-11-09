@@ -40,5 +40,13 @@
   "devDependencies": {
     "@types/node": "^20.0.0",
     "typescript": "^5.4.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/acus9345/mcp-forge-compiler.git"
+  },
+  "homepage": "https://github.com/acus9345/mcp-forge-compiler#readme",
+  "bugs": {
+    "url": "https://github.com/acus9345/mcp-forge-compiler/issues"
   }
 }
