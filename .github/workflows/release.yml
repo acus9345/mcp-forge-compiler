@@ -57,6 +57,8 @@ jobs:
           fi
       - run: npm install --no-audit --no-fund
         if: steps.exists.outputs.published == 'false'
+      - run: npm run build
+        if: steps.exists.outputs.published == 'false'
       - name: Publish (trusted publishing, with provenance; no stored token)
         if: steps.exists.outputs.published == 'false'
         run: npm publish --access public

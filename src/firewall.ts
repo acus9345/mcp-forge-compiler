@@ -57,18 +57,76 @@ const DESTRUCTIVE_SUBCOMMANDS = new Set([
   'format'
 ]);
 
-const SENSITIVE_SYSTEM_PATHS = [
-  '/etc/passwd',
-  '/etc/shadow',
-  '/etc/sudoers',
-  '/root',
-  '/.ssh',
-  '.ssh/id_rsa',
-  '.ssh/id_ed25519',
-  '.aws/credentials',
-  '.env',
-  '/proc/self/environ'
+const CAUTION_TOKENS = new Set([
+  'write',
+  'edit',
+  'modify',
+  'update',
+  'push',
+  'deploy',
+  'publish',
+  'install',
+  'exec',
+  'run',
+  'apply',
+  'commit',
+  'mutate',
+  '--write',
+  '--edit',
+  '--modify',
+  '--update',
+  '--push',
+  '--deploy',
+  '--publish',
+  '--install',
+  '--apply',
+  '--commit'
+]);
+
+const SENSITIVE_PATH_PATTERNS: Array<{ label: string; pattern: RegExp }> = [
+  { label: '/etc/passwd', pattern: /\/etc\/passwd(?=$|[\s'"/:;])/i },
+  { label: '/etc/shadow', pattern: /\/etc\/shadow(?=$|[\s'"/:;])/i },
+  { label: '/etc/sudoers', pattern: /\/etc\/sudoers(?=$|[\s'"/:;])/i },
+  { label: '/root', pattern: /(?:^|[\s'"=:])\/root(?=$|[/\s'":;])/i },
+  { label: '/.ssh', pattern: /\/\.ssh(?=$|[/\s'":;])/i },
+  { label: '.ssh/id_rsa', pattern: /\.ssh\/id_rsa(?=$|[\s'"/:;.])/i },
+  { label: '.ssh/id_ed25519', pattern: /\.ssh\/id_ed25519(?=$|[\s'"/:;.])/i },
+  { label: '.aws/credentials', pattern: /\.aws\/credentials(?=$|[\s'"/:;])/i },
+  { label: '.env', pattern: /(?:^|[\/\s'"=:])\.env(?:\.[a-z0-9_-]+)?(?=$|[\s'"/:;])/i },
+  { label: '/proc/self/environ', pattern: /\/proc\/self\/environ(?=$|[\s'"/:;])/i }
 ];
+
+function isWindowsDriveOrUnc(p: string): boolean {
+  return /^[a-zA-Z]:/.test(p) || p.startsWith('\\\\') || /^\\[^\\]*[\\/]/.test(p);
+}
+
+function isRelativeEscape(rel: string): boolean {
+  return (
+    rel === '..' ||
+    rel.startsWith('../') ||
+    rel.startsWith('..\\') ||
+    path.isAbsolute(rel) ||
+    isWindowsDriveOrUnc(rel)
+  );
+}
+
+function extractPathCandidates(token: string): string[] {
+  const candidates: string[] = [];
+  const eqIndex = token.indexOf('=');
+  if (token.startsWith('-') && eqIndex > 0) {
+    const val = token.slice(eqIndex + 1);
+    if (val) candidates.push(val);
+  } else if (/^-[a-zA-Z]/.test(token) && token.length > 2 && !token.startsWith('--')) {
+    // Handle attached short option value such as -C../../etc or -C/etc
+    const attached = token.slice(2);
+    if (attached.includes('..') || attached.startsWith('/') || attached.startsWith('~') || isWindowsDriveOrUnc(attached)) {
+      candidates.push(attached);
+    }
+  } else {
+    candidates.push(token);
+  }
+  return candidates;
+}
 
 /**
  * Formats an argv list into a human-readable POSIX shell preview with safe quoting.
@@ -93,8 +151,11 @@ export function auditCommandExecution(
   const violations: FirewallViolation[] = [];
   let riskScore = 0;
 
-  // 1. Check binary name itself
-  const baseBinary = path.basename(binary);
+  // 1. Check binary name itself (cross-platform: strip path & executable extension)
+  const baseBinary = path.posix
+    .basename(binary.replace(/\\/g, '/'))
+    .toLowerCase()
+    .replace(/\.(exe|cmd|bat|com|ps1|sh)$/, '');
   if (DESTRUCTIVE_SUBCOMMANDS.has(baseBinary)) {
     violations.push({
       ruleId: 'FW001_DESTRUCTIVE_BINARY',
@@ -128,9 +189,13 @@ export function auditCommandExecution(
     // 3. Destructive flag or subcommand check
     if (mergedPolicy.blockDestructiveFlags) {
       const normalizedFlag = token.split('=')[0].trim();
+      const lowerFlag = normalizedFlag.toLowerCase();
+      const isDestructiveLongFlag =
+        normalizedFlag.startsWith('--') && DESTRUCTIVE_FLAG_SET.has(lowerFlag);
       if (
+        isDestructiveLongFlag ||
         DESTRUCTIVE_FLAG_SET.has(normalizedFlag) ||
-        DESTRUCTIVE_SUBCOMMANDS.has(normalizedFlag.toLowerCase())
+        DESTRUCTIVE_SUBCOMMANDS.has(lowerFlag)
       ) {
         violations.push({
           ruleId: 'FW003_DESTRUCTIVE_FLAG',
@@ -158,31 +223,46 @@ export function auditCommandExecution(
 
     // 5. Sensitive system & credential file access check
     const normalizedToken = token.replace(/\\/g, '/');
-    for (const sensitivePath of SENSITIVE_SYSTEM_PATHS) {
-      if (
-        normalizedToken === sensitivePath ||
-        normalizedToken.endsWith(`/${sensitivePath}`) ||
-        normalizedToken.includes(sensitivePath)
-      ) {
+    for (const sensitive of SENSITIVE_PATH_PATTERNS) {
+      if (sensitive.pattern.test(normalizedToken)) {
         violations.push({
           ruleId: 'FW005_SENSITIVE_PATH',
           severity: 'critical',
           token,
-          reason: `Argument references sensitive credential or system path '${sensitivePath}'.`,
+          reason: `Argument references sensitive credential or system path '${sensitive.label}'.`,
           remediation: 'Restrict file operations to non-sensitive project files.'
         });
         riskScore += 95;
+        break;
       }
     }
 
     // 6. Path traversal outside allowedWorkingDir
     if (mergedPolicy.allowedWorkingDir) {
-      const looksLikePath =
-        token.includes('..') || token.startsWith('/') || token.startsWith('~');
-      if (looksLikePath && !token.startsWith('--')) {
-        const resolvedRoot = path.resolve(mergedPolicy.allowedWorkingDir);
-        const resolvedTarget = path.resolve(mergedPolicy.allowedWorkingDir, token);
-        if (!resolvedTarget.startsWith(resolvedRoot + path.sep) && resolvedTarget !== resolvedRoot) {
+      const resolvedRoot = path.resolve(mergedPolicy.allowedWorkingDir);
+      for (const candidate of extractPathCandidates(token)) {
+        const looksLikePath =
+          candidate.includes('..') ||
+          candidate.startsWith('/') ||
+          candidate === '~' ||
+          candidate.startsWith('~/') ||
+          candidate.startsWith('~\\') ||
+          isWindowsDriveOrUnc(candidate);
+        if (!looksLikePath) continue;
+
+        const isHomeEscape =
+          candidate === '~' || candidate.startsWith('~/') || candidate.startsWith('~\\');
+        const isCrossPlatformRoot =
+          isWindowsDriveOrUnc(candidate) && !isWindowsDriveOrUnc(resolvedRoot);
+
+        let outsideWorkspace = isHomeEscape || isCrossPlatformRoot;
+        if (!outsideWorkspace) {
+          const resolvedTarget = path.resolve(resolvedRoot, candidate);
+          const rel = path.relative(resolvedRoot, resolvedTarget);
+          outsideWorkspace = isRelativeEscape(rel);
+        }
+
+        if (outsideWorkspace) {
           violations.push({
             ruleId: 'FW006_PATH_TRAVERSAL',
             severity: 'critical',
@@ -191,7 +271,23 @@ export function auditCommandExecution(
             remediation: `Keep all file paths inside '${resolvedRoot}'.`
           });
           riskScore += 80;
+          break;
         }
+      }
+    }
+
+    // 7. Caution / mutating action check when dry-run enforcement is enabled
+    if (mergedPolicy.enforceDryRunOnCaution) {
+      const normalizedCaution = token.split('=')[0].trim().toLowerCase();
+      if (CAUTION_TOKENS.has(normalizedCaution)) {
+        violations.push({
+          ruleId: 'FW007_CAUTION_MUTATION',
+          severity: 'medium',
+          token,
+          reason: `Argument '${normalizedCaution}' may mutate external or repository state; dry-run preview required.`,
+          remediation: 'Inspect the dry-run preview and rerun with enforceDryRunOnCaution disabled to execute.'
+        });
+        riskScore += 25;
       }
     }
   }

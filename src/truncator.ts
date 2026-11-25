@@ -18,6 +18,10 @@ const SECRET_REDACTION_PATTERNS: Array<{ name: string; regex: RegExp }> = [
     regex: /Bearer\s+[A-Za-z0-9._~+/-]{20,}/gi
   },
   {
+    name: 'PEM Private Key',
+    regex: /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g
+  },
+  {
     name: 'Generic Secret Assignment',
     regex: /((?:api_key|apikey|secret|password|token|access_token)\s*[:=]\s*["']?)([A-Za-z0-9._~+/-]{12,})(["']?)/gi
   }
@@ -110,7 +114,8 @@ export function truncateCliOutput(
   rawText: string,
   options: TruncatorOptions
 ): TruncatedOutput {
-  const headRatio = options.headRatio ?? 0.65;
+  const rawHeadRatio = options.headRatio ?? 0.65;
+  const headRatio = Math.min(0.9, Math.max(0.1, Number.isFinite(rawHeadRatio) ? rawHeadRatio : 0.65));
   const preserveDiagnosticLines = options.preserveDiagnosticLines ?? true;
   const shouldScrub = options.scrubSecrets ?? true;
 
@@ -141,9 +146,53 @@ export function truncateCliOutput(
   }
 
   const maxChars = Math.max(120, options.maxTokens * 4);
-  const bannerReserveChars = 260;
-  const usableChars = Math.max(80, maxChars - bannerReserveChars);
+  const bannerReserveChars = 170;
+  const baseUsableChars = Math.max(80, maxChars - bannerReserveChars);
 
+  // Reserve a bounded portion of usableChars for diagnostics if needed, then split remainder between head and tail
+  const initialHeadBudget = Math.floor(baseUsableChars * headRatio);
+  const initialTailBudget = baseUsableChars - initialHeadBudget;
+
+  // Estimate initial head/tail split to locate omitted middle range for diagnostics
+  let estHeadEnd = 0;
+  let estHeadChars = 0;
+  while (estHeadEnd < lines.length && estHeadChars + lines[estHeadEnd].length + 1 <= initialHeadBudget) {
+    estHeadChars += lines[estHeadEnd].length + 1;
+    estHeadEnd++;
+  }
+  if (estHeadEnd === 0 && lines.length > 0) estHeadEnd = 1;
+
+  let estTailStart = lines.length - 1;
+  let estTailChars = 0;
+  while (estTailStart >= estHeadEnd && estTailChars + lines[estTailStart].length + 1 <= initialTailBudget) {
+    estTailChars += lines[estTailStart].length + 1;
+    estTailStart--;
+  }
+
+  const diagnosticLines: string[] = [];
+  const maxDiagnosticLines = 8;
+  const maxDiagnosticBudget = Math.floor(baseUsableChars * 0.45);
+  let diagnosticChars = 0;
+  if (preserveDiagnosticLines && estTailStart >= estHeadEnd) {
+    const diagHeaderFooterChars = 95;
+    for (let i = estHeadEnd; i <= estTailStart; i++) {
+      if (DIAGNOSTIC_LINE_REGEX.test(lines[i])) {
+        const entry = `[line ${i + 1}] ${lines[i].slice(0, 140)}`;
+        if (
+          diagnosticLines.length > 0 &&
+          diagnosticChars + diagHeaderFooterChars + entry.length + 1 > maxDiagnosticBudget
+        ) {
+          break;
+        }
+        diagnosticLines.push(entry);
+        diagnosticChars += entry.length + 1;
+        if (diagnosticLines.length >= maxDiagnosticLines) break;
+      }
+    }
+  }
+
+  const diagOverhead = diagnosticLines.length > 0 ? diagnosticChars + 95 : 0;
+  const usableChars = Math.max(60, baseUsableChars - diagOverhead);
   const headBudgetChars = Math.floor(usableChars * headRatio);
   const tailBudgetChars = usableChars - headBudgetChars;
 
@@ -157,7 +206,7 @@ export function truncateCliOutput(
     headIndex++;
   }
 
-  // Ensure at least the first line (e.g. table header) is kept if possible
+  // Ensure at least the first line (e.g. table header or single giant line) is kept
   if (headLines.length === 0 && lines.length > 0) {
     headLines.push(lines[0].slice(0, headBudgetChars));
     headIndex = 1;
@@ -176,28 +225,30 @@ export function truncateCliOutput(
     tailIndex--;
   }
 
-  // Scan the omitted middle range [headIndex .. tailIndex] for high-signal error/diagnostic lines
-  const diagnosticLines: string[] = [];
-  const maxDiagnosticLines = 8;
-  if (preserveDiagnosticLines && tailIndex >= headIndex) {
-    for (let i = headIndex; i <= tailIndex; i++) {
-      if (DIAGNOSTIC_LINE_REGEX.test(lines[i])) {
-        diagnosticLines.push(`[line ${i + 1}] ${lines[i].slice(0, 180)}`);
-        if (diagnosticLines.length >= maxDiagnosticLines) break;
-      }
+  // If tail is empty because the last line itself exceeded tailBudgetChars (including single-line inputs)
+  if (tailLines.length === 0 && tailBudgetChars >= 16) {
+    if (tailIndex >= headIndex) {
+      tailLines.push(lines[tailIndex].slice(-tailBudgetChars));
+      tailIndex--;
+    } else if (lines.length === 1 && lines[0].length > headBudgetChars) {
+      tailLines.push(lines[0].slice(-tailBudgetChars));
     }
   }
 
   const omittedLines = Math.max(0, tailIndex - headIndex + 1);
+  const omittedCharsNote =
+    omittedLines === 0 && lines.length === 1
+      ? `omitted middle of 1 long line`
+      : `omitted ${omittedLines} lines`;
   const middleSummaryParts: string[] = [
-    `... [mcp-forge Context Guard: omitted ${omittedLines} lines (${
-      originalEstimatedTokens - options.maxTokens
-    }+ excess tokens) to protect LLM context window | format=${detectedFormat}] ...`
+    `... [mcp-forge Context Guard: ${omittedCharsNote} (${
+      Math.max(1, originalEstimatedTokens - options.maxTokens)
+    }+ excess tokens) | format=${detectedFormat}] ...`
   ];
 
   if (diagnosticLines.length > 0) {
     middleSummaryParts.push(
-      `--- Preserved Diagnostic / Error Signals from omitted section (${diagnosticLines.length}) ---`,
+      `--- Preserved Diagnostic / Error Signals (${diagnosticLines.length}) ---`,
       ...diagnosticLines,
       `--- End Preserved Signals ---`
     );

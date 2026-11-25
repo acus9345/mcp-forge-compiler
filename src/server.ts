@@ -98,6 +98,17 @@ export class McpForgeServer {
   }
 
   public async handleRequest(req: JsonRpcRequest): Promise<JsonRpcResponse | null> {
+    if (!req || typeof req !== 'object' || Array.isArray(req) || typeof req.method !== 'string') {
+      return {
+        jsonrpc: '2.0',
+        id: req && typeof req === 'object' && 'id' in req ? (req.id ?? null) : null,
+        error: {
+          code: -32600,
+          message: 'Invalid Request'
+        }
+      };
+    }
+
     // Notifications (no id) do not return a response
     if (req.id === undefined) {
       return null;
@@ -138,12 +149,35 @@ export class McpForgeServer {
           };
 
         case 'tools/call': {
+          if (req.params !== undefined && (typeof req.params !== 'object' || req.params === null || Array.isArray(req.params))) {
+            return {
+              jsonrpc: '2.0',
+              id: req.id,
+              error: {
+                code: -32602,
+                message: 'Invalid params: expected an object'
+              }
+            };
+          }
           const params = (req.params || {}) as {
-            name?: string;
-            arguments?: Record<string, unknown>;
+            name?: unknown;
+            arguments?: unknown;
           };
-          const toolName = params.name || '';
-          const toolArgs = params.arguments || {};
+          if (
+            params.arguments !== undefined &&
+            (typeof params.arguments !== 'object' || params.arguments === null || Array.isArray(params.arguments))
+          ) {
+            return {
+              jsonrpc: '2.0',
+              id: req.id,
+              error: {
+                code: -32602,
+                message: 'Invalid params: tool arguments must be an object'
+              }
+            };
+          }
+          const toolName = typeof params.name === 'string' ? params.name : '';
+          const toolArgs = (params.arguments || {}) as Record<string, unknown>;
 
           const spec = this.specMap.get(toolName);
           if (!spec) {
@@ -219,7 +253,10 @@ export class McpForgeServer {
             const { stdout, stderr } = await execFileAsync(spec.binaryName, argv, {
               timeout: this.timeoutMs,
               maxBuffer: 10 * 1024 * 1024,
-              env: createSanitizedEnv()
+              env: createSanitizedEnv(),
+              ...(this.firewallPolicy.allowedWorkingDir
+                ? { cwd: this.firewallPolicy.allowedWorkingDir }
+                : {})
             });
             const combinedOut = [stdout, stderr].filter(Boolean).join('\n');
             const truncated = truncateCliOutput(combinedOut, this.truncatorOptions);

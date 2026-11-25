@@ -53,14 +53,14 @@ export function inferOptionType(argName?: string, description: string = ''): {
     }
   }
 
-  // Check description for explicit choices e.g. [possible values: auto, always, never] or (choices: a, b, c)
+  // Extract choices from description, e.g. [possible values: auto, always, never] or (choices: a, b, c)
   const enumMatch =
     description.match(/(?:possible values|choices|values|one of)\s*:\s*([a-zA-Z0-9_.,\s|-]+)/i) ||
     description.match(/\[(auto|always|never|[a-z0-9_-]+(?:\s*\|\s*[a-z0-9_-]+)+)\]/i);
 
   let enumValues: string[] | undefined;
   if (enumMatch) {
-    const rawList = enumMatch[1];
+    const rawList = enumMatch[1].split(/[.;\n]/)[0];
     const items = rawList
       .split(/[,|]|\bor\b/)
       .map((s) => s.replace(/[\[\]()."']/g, '').trim())
@@ -145,22 +145,34 @@ export function parseCliHelp(binaryName: string, helpText: string): ParsedCliSpe
   let currentSection: 'preamble' | 'usage' | 'options' | 'commands' | 'examples' | 'other' =
     'preamble';
 
-  // Regex for option lines:
-  // Matches:
-  //   -f, --flag <VAL>     Description
-  //   --long-only=VALUE    Description
-  //   -v                   Description
-  const optionLineRegex =
-    /^\s{1,12}(?:(-[a-zA-Z0-9?])(?:\s*,\s*|\s+))?(?:(--[a-zA-Z0-9][a-zA-Z0-9_.-]*))?(?:[=\s]+(<[^>]+>|\[[a-zA-Z0-9_|-]+\]|[A-Z0-9_|-]{2,}))?(?:\s{2,}|\t+)(.+)$/;
+  // Shared flag + optional argument header pattern:
+  // Supports short+long (-f, --flag), long-only (--flag, --[no-]flag), short-only (-C <path>, -v),
+  // and value placeholders (<VAL>, <GLOB>..., [VAL], VALUE, [=VAL]).
+  const flagCore =
+    '(?:(-[a-zA-Z0-9?])(?:\\s*,\\s*|\\s+)(--(?:\\[no-\\])?[a-zA-Z0-9][a-zA-Z0-9_.-]*)|(--(?:\\[no-\\])?[a-zA-Z0-9][a-zA-Z0-9_.-]*)|(-[a-zA-Z0-9?]))';
+  const argCore =
+    '(?:(?:=| )((?:<[^>]+>|\\[[a-zA-Z0-9_.|<>-]+\\]|[A-Z0-9_|-]{2,})(?:\\.\\.\\.)?)|(\\[=[^\\]]+\\]))?';
 
-  // Secondary option line regex where description is on the NEXT indented line
-  const optionHeaderOnlyRegex =
-    /^\s{1,12}(?:(-[a-zA-Z0-9?])(?:\s*,\s*|\s+))?(--[a-zA-Z0-9][a-zA-Z0-9_.-]*)(?:[=\s]+(<[^>]+>|\[[a-zA-Z0-9_|-]+\]|[A-Z0-9_|-]{2,}))?\s*$/;
+  const optionLineRegex = new RegExp(`^\\s{1,12}${flagCore}${argCore}(?:\\s{2,}|\\t+)(.+)$`);
+  const optionHeaderOnlyRegex = new RegExp(`^\\s{1,12}${flagCore}${argCore}\\s*$`);
 
   // Subcommand line regex when inside a COMMANDS section:
   //   build, b     Compile the current package
   const subcommandLineRegex =
-    /^\s{2,8}([a-zA-Z0-9][a-zA-Z0-9_-]*)(?:,\s*([a-zA-Z0-9_-]+))?\s{2,}(.+)$/;
+    /^\s{1,12}([a-zA-Z0-9][a-zA-Z0-9_:-]*)(?:,\s*([a-zA-Z0-9_:-]+))?(?:\s{2,}|\t+)(.+)$/;
+
+  const extractOptionParts = (m: RegExpMatchArray) => {
+    const shortFlag = (m[1] || m[4])?.trim();
+    const rawLong = (m[2] || m[3])?.trim();
+    const longFlag = rawLong?.startsWith('--[no-]')
+      ? `--${rawLong.slice('--[no-]'.length)}`
+      : rawLong;
+    const rawArg = (m[5] || m[6])?.trim();
+    const argName = rawArg?.startsWith('[=')
+      ? rawArg.slice(2, -1).trim()
+      : rawArg;
+    return { shortFlag, longFlag, argName };
+  };
 
   for (let i = 0; i < lines.length; i++) {
     const rawLine = lines[i];
@@ -177,9 +189,9 @@ export function parseCliHelp(binaryName: string, helpText: string): ParsedCliSpe
     }
 
     // Section headers
-    if (/^(usage|synopsis)\s*:?/i.test(trimmed)) {
+    if (/^(?:usage|synopsis)\s*:|^(?:USAGE|SYNOPSIS)\b/.test(trimmed)) {
       currentSection = 'usage';
-      const inlineUsage = trimmed.replace(/^(usage|synopsis)\s*:?\s*/i, '').trim();
+      const inlineUsage = trimmed.replace(/^(?:usage|synopsis)\s*:?\s*/i, '').trim();
       if (inlineUsage) usagePatterns.push(inlineUsage);
       continue;
     }
@@ -189,7 +201,7 @@ export function parseCliHelp(binaryName: string, helpText: string): ParsedCliSpe
       continue;
     }
 
-    if (/^(commands|subcommands|available commands|main commands|core commands)[\s:]*$/i.test(trimmed)) {
+    if (/^(commands|subcommands|available commands|main commands|core commands|management commands|common commands|other commands|additional commands)[\s:]*$/i.test(trimmed)) {
       currentSection = 'commands';
       continue;
     }
@@ -214,11 +226,9 @@ export function parseCliHelp(binaryName: string, helpText: string): ParsedCliSpe
 
     // Try matching an option line anywhere (many tools don't have explicit OPTIONS: headers)
     const optMatch = rawLine.match(optionLineRegex);
-    if (optMatch && (optMatch[1] || optMatch[2])) {
-      const shortFlag = optMatch[1]?.trim();
-      const longFlag = optMatch[2]?.trim();
-      const argName = optMatch[3]?.trim();
-      let desc = optMatch[4].trim();
+    if (optMatch) {
+      const { shortFlag, longFlag, argName } = extractOptionParts(optMatch);
+      let desc = optMatch[7].trim();
 
       // Check if subsequent lines are deeply indented continuations
       while (i + 1 < lines.length && /^\s{14,}\S/.test(lines[i + 1])) {
@@ -249,9 +259,7 @@ export function parseCliHelp(binaryName: string, helpText: string): ParsedCliSpe
     // Multi-line option where description is on the next line (common in clap / cargo / ripgrep)
     const headerOnlyMatch = rawLine.match(optionHeaderOnlyRegex);
     if (headerOnlyMatch && i + 1 < lines.length && /^\s{6,}\S/.test(lines[i + 1])) {
-      const shortFlag = headerOnlyMatch[1]?.trim();
-      const longFlag = headerOnlyMatch[2]?.trim();
-      const argName = headerOnlyMatch[3]?.trim();
+      const { shortFlag, longFlag, argName } = extractOptionParts(headerOnlyMatch);
       let desc = lines[i + 1].trim();
       i++;
       while (i + 1 < lines.length && /^\s{6,}\S/.test(lines[i + 1]) && !lines[i + 1].trim().startsWith('-')) {
@@ -444,7 +452,9 @@ export function buildArgvFromToolInput(
       }
     } else if (opt.type === 'array' && Array.isArray(val)) {
       for (const item of val) {
-        argv.push(flag, String(item));
+        if (item !== undefined && item !== null) {
+          argv.push(flag, String(item));
+        }
       }
     } else {
       argv.push(flag, String(val));

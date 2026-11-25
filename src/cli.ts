@@ -78,9 +78,90 @@ async function runDemo(): Promise<void> {
   });
 }
 
+interface ParsedForgeOptions {
+  maxTokens: number;
+  workspace?: string;
+  helpRequested: boolean;
+  positionals: string[];
+}
+
+function parseForgeArgs(args: string[], stopAtFirstPositional: boolean): ParsedForgeOptions {
+  let maxTokens = 1500;
+  let workspace: string | undefined;
+  let helpRequested = false;
+  const positionals: string[] = [];
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+
+    if (stopAtFirstPositional && positionals.length > 0) {
+      positionals.push(arg);
+      continue;
+    }
+
+    if (arg === '--') {
+      positionals.push(...args.slice(i + 1));
+      break;
+    }
+
+    if (arg === '-h' || arg === '--help') {
+      helpRequested = true;
+      continue;
+    }
+
+    if (arg === '--workspace') {
+      const val = args[i + 1];
+      if (!val || val.startsWith('-')) {
+        throw new Error('mcp-forge: --workspace requires a directory path');
+      }
+      workspace = val;
+      i++;
+      continue;
+    }
+
+    if (arg.startsWith('--workspace=')) {
+      const val = arg.slice('--workspace='.length);
+      if (!val) {
+        throw new Error('mcp-forge: --workspace requires a directory path');
+      }
+      workspace = val;
+      continue;
+    }
+
+    if (arg === '--max-tokens') {
+      const val = args[i + 1];
+      const parsed = Number(val);
+      if (!val || !Number.isInteger(parsed) || parsed <= 0) {
+        throw new Error('mcp-forge: --max-tokens requires a positive integer');
+      }
+      maxTokens = parsed;
+      i++;
+      continue;
+    }
+
+    if (arg.startsWith('--max-tokens=')) {
+      const val = arg.slice('--max-tokens='.length);
+      const parsed = Number(val);
+      if (!val || !Number.isInteger(parsed) || parsed <= 0) {
+        throw new Error('mcp-forge: --max-tokens requires a positive integer');
+      }
+      maxTokens = parsed;
+      continue;
+    }
+
+    if (arg.startsWith('-')) {
+      throw new Error(`mcp-forge: unknown option '${arg}' (see --help)`);
+    }
+
+    positionals.push(arg);
+  }
+
+  return { maxTokens, workspace, helpRequested, positionals };
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
-  if (args.length === 0 || args.includes('-h') || args.includes('--help')) {
+  if (args.length === 0 || args[0] === '-h' || args[0] === '--help') {
     printUsage();
     return;
   }
@@ -89,18 +170,27 @@ async function main(): Promise<void> {
   const rest = args.slice(1);
 
   if (subcommand === 'demo') {
+    const parsed = parseForgeArgs(rest, false);
+    if (parsed.helpRequested) {
+      printUsage();
+      return;
+    }
     await runDemo();
     return;
   }
 
   if (subcommand === 'compile') {
-    if (rest.length === 0) {
+    const parsed = parseForgeArgs(rest, false);
+    if (parsed.helpRequested) {
+      printUsage();
+      return;
+    }
+    if (parsed.positionals.length === 0) {
       console.error('mcp-forge: missing binary name (e.g. mcp-forge compile git rg)');
       process.exit(1);
     }
     const specs = [];
-    for (const bin of rest) {
-      if (bin.startsWith('-')) continue;
+    for (const bin of parsed.positionals) {
       specs.push(await introspectLocalBinary(bin));
     }
     const compiled = specs.flatMap((s) => compileToMcpTools(s));
@@ -109,26 +199,44 @@ async function main(): Promise<void> {
   }
 
   if (subcommand === 'audit') {
-    if (rest.length === 0) {
+    const parsed = parseForgeArgs(rest, true);
+    if (parsed.helpRequested && parsed.positionals.length === 0) {
+      printUsage();
+      return;
+    }
+    if (parsed.positionals.length === 0) {
       console.error('mcp-forge: missing command to audit');
       process.exit(1);
     }
-    const result = auditCommandExecution(rest[0], rest.slice(1));
+    const policy = parsed.workspace ? { allowedWorkingDir: parsed.workspace } : {};
+    const result = auditCommandExecution(
+      parsed.positionals[0],
+      parsed.positionals.slice(1),
+      policy
+    );
     console.log(JSON.stringify(result, null, 2));
     process.exit(result.status === 'block' ? 2 : 0);
   }
 
   if (subcommand === 'serve') {
-    const binaries = rest.filter((a) => !a.startsWith('-'));
-    if (binaries.length === 0) {
+    const parsed = parseForgeArgs(rest, false);
+    if (parsed.helpRequested) {
+      printUsage();
+      return;
+    }
+    if (parsed.positionals.length === 0) {
       console.error('mcp-forge: specify at least one binary to serve');
       process.exit(1);
     }
     const specs = [];
-    for (const bin of binaries) {
+    for (const bin of parsed.positionals) {
       specs.push(await introspectLocalBinary(bin));
     }
-    const server = new McpForgeServer({ specs });
+    const server = new McpForgeServer({
+      specs,
+      firewallPolicy: parsed.workspace ? { allowedWorkingDir: parsed.workspace } : undefined,
+      truncatorOptions: { maxTokens: parsed.maxTokens }
+    });
     server.startStdio();
     return;
   }
@@ -138,6 +246,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  console.error(err);
+  console.error(err instanceof Error ? err.message : err);
   process.exit(1);
 });
